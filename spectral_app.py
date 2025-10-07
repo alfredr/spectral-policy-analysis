@@ -35,7 +35,7 @@ st.sidebar.subheader("Resource Assignment Generation")
 m = st.sidebar.number_input("Users (m)", 20, 400, 120, 10)
 n = st.sidebar.number_input("Resources (n)", 20, 400, 120, 10)
 num_blocks = st.sidebar.number_input("Num groups", 1, 20, 6, 1)
-density = st.sidebar.slider("Block density", 0.1, 1.0, 0.9, 0.05)
+noise = st.sidebar.slider("Noise rate", 0.0, 0.5, 0.0, 0.01)
 seed = st.sidebar.number_input("Random seed", 0, 10_000, 7, 1)
 
 if st.sidebar.button("Regenerate"):
@@ -75,19 +75,20 @@ st.sidebar.info(f"Using **randomized SVD** with seed={seed}")
 
 # Cache generation + per-kernel spectral factors
 @st.cache_data
-def generate_P(m, n, num_blocks, density, seed, permute):
-    P, planted = stamp_blocks(
+def generate_P(m, n, num_blocks, noise, seed, permute):
+    P, planted, noise_count = stamp_blocks(
         m,
         n,
         num_blocks=num_blocks,
         min_hw=(max(4, m // 15), max(4, n // 15)),
         max_hw=(max(6, m // 6), max(6, n // 6)),
-        density=density,
+        density=1.0,
+        noise=noise,
         seed=seed,
     )
     if permute:
         P, planted, _, _ = permute_matrix(P, planted, seed=seed)
-    return P, planted
+    return P, planted, noise_count
 
 
 @st.cache_data
@@ -103,7 +104,7 @@ def compute_alignment(P, measure, k, seed):
 
 
 # Generate data
-P, planted = generate_P(m, n, num_blocks, density, seed, permute_viz)
+P, planted, noise_count = generate_P(m, n, num_blocks, noise, seed, permute_viz)
 
 # Compute SVD & alignment
 U, s, Vt = compute_svd(P, kernel, seed)
@@ -211,7 +212,7 @@ fig1.add_trace(
 fig1.add_trace(
     go.Heatmap(
         z=viz_diff(P_recon),
-        colorscale=[[0, "white"], [0.49, "white"], [0.51, "black"], [0.99, "black"], [1, "red"]],
+        colorscale=[[0, "white"], [0.499, "white"], [0.5, "black"], [0.999, "black"], [1, "red"]],
         showscale=False,
         customdata=np.stack([P, P_recon], axis=-1),
         hovertemplate="user=%{y}<br>res=%{x}<br>original=%{customdata[0]}<br>kernel=%{customdata[1]}<extra></extra>",
@@ -227,9 +228,51 @@ for c in [1, 2, 3]:
 fig1.update_layout(height=520, showlegend=False)
 st.plotly_chart(fig1, use_container_width=True)
 
+# ====== Policy Complexity ======
+st.markdown("### Policy Complexity")
+base_complexity = n + m + noise_count
+fit_complexity = decomp['complexity']
+residual_complexity = fit_complexity - base_complexity
 
-# ====== Metrics ======
-st.markdown("### Metrics")
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Base Complexity", base_complexity)
+with col2:
+    st.metric("Base Groups", num_blocks)
+with col3:
+    st.metric("Base Exceptions", noise_count)
+with col4:
+    st.metric("Residual Complexity", residual_complexity)
+
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Fit Complexity", fit_complexity)
+with col2:
+    st.metric("Fit Groups", decomp['num_groups'])
+with col3:
+    st.metric("Fit Exceptions", decomp['num_exceptions'])
+
+with st.expander("View policy tuples"):
+    st.markdown("**User → Group tuples**")
+    user_group_text = ", ".join([f"u{u}→g{g}" for u, g in decomp['user_to_group'][:30]])
+    if len(decomp['user_to_group']) > 30:
+        user_group_text += f" ... ({len(decomp['user_to_group'])} total)"
+    st.text(user_group_text)
+
+    st.markdown("**Resource → Group tuples**")
+    res_group_text = ", ".join([f"r{r}→g{g}" for r, g in decomp['resource_to_group'][:30]])
+    if len(decomp['resource_to_group']) > 30:
+        res_group_text += f" ... ({len(decomp['resource_to_group'])} total)"
+    st.text(res_group_text)
+
+    st.markdown("**Exceptions**")
+    exc_text = ", ".join([f"{op}(u{u}, r{r})" for op, u, r in decomp['exceptions'][:30]])
+    if len(decomp['exceptions']) > 30:
+        exc_text += f" ... ({len(decomp['exceptions'])} total)"
+    st.text(exc_text if exc_text else "(none)")
+
+# ====== Spectral Analysis ======
+st.markdown("### Spectral Analysis")
 c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     st.metric("AUPRC", f"{pr['auprc']:.3f}")
@@ -274,23 +317,6 @@ fig_spectra.add_trace(
 fig_spectra.update_layout(height=360, showlegend=True)
 st.plotly_chart(fig_spectra, use_container_width=True)
 
-st.markdown("### Group-based policy decomposition")
-st.markdown("Express the policy as **tuples**: (user→group) + (resource→group) + exceptions")
-st.markdown("*Complexity = total # of tuples*")
-
-st.metric("Complexity (total tuples)", decomp['complexity'])
-
-# Breakdown
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("u→g", decomp['num_user_group_tuples'])
-with col2:
-    st.metric("r→g", decomp['num_resource_group_tuples'])
-with col3:
-    st.metric("Exceptions", decomp['num_exceptions'])
-
-st.caption(f"Active groups: {decomp['num_groups']}")
-
 # Diagnostics: check for users/resources without group membership
 users_with_groups = set(u for u, g in decomp['user_to_group'])
 resources_with_groups = set(r for r, g in decomp['resource_to_group'])
@@ -303,22 +329,3 @@ if orphan_users > 0 or orphan_resources > 0:
 # Show comparison with FP+FN
 tp, fp, fn, prec, rec = bin_stats(P_recon)
 st.caption(f"(SVD reconstruction has {fp + fn} errors = FP+FN)")
-
-with st.expander("View policy tuples"):
-    st.markdown("**User → Group tuples**")
-    user_group_text = ", ".join([f"u{u}→g{g}" for u, g in decomp['user_to_group'][:30]])
-    if len(decomp['user_to_group']) > 30:
-        user_group_text += f" ... ({len(decomp['user_to_group'])} total)"
-    st.text(user_group_text)
-
-    st.markdown("**Resource → Group tuples**")
-    res_group_text = ", ".join([f"r{r}→g{g}" for r, g in decomp['resource_to_group'][:30]])
-    if len(decomp['resource_to_group']) > 30:
-        res_group_text += f" ... ({len(decomp['resource_to_group'])} total)"
-    st.text(res_group_text)
-
-    st.markdown("**Exceptions**")
-    exc_text = ", ".join([f"{op}(u{u}, r{r})" for op, u, r in decomp['exceptions'][:30]])
-    if len(decomp['exceptions']) > 30:
-        exc_text += f" ... ({len(decomp['exceptions'])} total)"
-    st.text(exc_text if exc_text else "(none)")

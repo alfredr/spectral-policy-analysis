@@ -24,15 +24,18 @@ def stamp_blocks(
     min_hw: Tuple[int, int] = (8, 8),
     max_hw: Tuple[int, int] = (20, 20),
     density: float = 1.0,
+    noise: float = 0.0,
     seed: Optional[int] = 42,
-) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+) -> Tuple[np.ndarray, List[Dict[str, Any]], int]:
     """
     Create an m x n binary matrix P by stamping 'num_blocks' random rectangles of 1s.
     Each rectangle has height in [min_hw[0], max_hw[0]] and width in [min_hw[1], max_hw[1]].
     If density < 1, we flip each candidate 1 to 0 independently with prob (1-density).
+    If noise > 0, we XOR the matrix with a noise matrix containing 1s at the given rate.
     Returns:
       P : (m x n) uint8 array
       blocks : list of dicts with {'r0','c0','h','w'} for each planted block
+      noise_count : number of bit flips applied (base exception rate)
     """
     rng = np.random.default_rng(seed)
     P = np.zeros((m, n), dtype=np.uint8)
@@ -49,7 +52,14 @@ def stamp_blocks(
             block = (block & mask.astype(np.uint8)).astype(np.uint8)
         P[r0 : r0 + h, c0 : c0 + w] |= block  # union with existing 1s
         blocks.append({"r0": int(r0), "c0": int(c0), "h": int(h), "w": int(w)})
-    return P, blocks
+
+    noise_count = 0
+    if noise > 0.0:
+        noise_matrix = (rng.random((m, n)) < noise).astype(np.uint8)
+        noise_count = int(noise_matrix.sum())
+        P = (P ^ noise_matrix).astype(np.uint8)
+
+    return P, blocks, noise_count
 
 
 def raw_T(P: np.ndarray, S: np.ndarray) -> float:
@@ -602,10 +612,11 @@ def optimize_svd_params(
                 best_tau = current_tau
                 improved = True
 
-        # Optimize j with fixed tau (discrete search)
+        # Optimize j with fixed tau (discrete search, prefer smaller ranks)
         for j in range(j_range[0], max_j + 1):
             decomp = svd_based_group_decomposition(P, U, s, Vt, j, threshold=current_tau)
-            if decomp['complexity'] < best_complexity:
+            # Prefer smaller j if complexity is equal or better
+            if decomp['complexity'] < best_complexity or (decomp['complexity'] == best_complexity and j < best_j):
                 best_complexity = decomp['complexity']
                 current_j = j
                 best_j = j
