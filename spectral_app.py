@@ -53,7 +53,7 @@ if 'tau_value' not in st.session_state:
     st.session_state.tau_value = 0.5
 
 j = st.sidebar.slider("Rank j (SVD components)", 1, 40, st.session_state.j_value, 1, key="j_slider")
-tau = st.sidebar.slider("Threshold τ (group membership & reconstruction)", 0.0, 1.0, st.session_state.tau_value, 0.01, key="tau_slider")
+tau = st.sidebar.slider("Threshold tau (group membership & reconstruction)", 0.0, 1.0, st.session_state.tau_value, 0.01, key="tau_slider")
 
 # Update session state when sliders change
 st.session_state.j_value = j
@@ -118,7 +118,7 @@ if 'optimize_now' in st.session_state and st.session_state.optimize_now:
         st.session_state.j_value = opt_result['best_j']
         st.session_state.tau_value = opt_result['best_tau']
         st.session_state.optimize_now = False
-        st.success(f"Optimal parameters set: j={opt_result['best_j']}, τ={opt_result['best_tau']:.2f}, complexity={opt_result['min_complexity']}")
+        st.success(f"Optimal parameters set: j={opt_result['best_j']}, tau={opt_result['best_tau']:.2f}, complexity={opt_result['min_complexity']}")
         st.rerun()
 
 # Reconstruction & thresholding
@@ -167,7 +167,7 @@ fig1 = make_subplots(
     subplot_titles=(
         f"Original (assignments={int(P.sum())})",
         f"{kernel} kernel | Rank-{j}",
-        f"Symmetric difference (τ={tau:.2f})",
+        f"Symmetric difference (tau={tau:.2f})",
     ),
     horizontal_spacing=0.08,
 )
@@ -253,14 +253,14 @@ with col3:
     st.metric("Fit Exceptions", decomp['num_exceptions'])
 
 with st.expander("View policy tuples"):
-    st.markdown("**User → Group tuples**")
-    user_group_text = ", ".join([f"u{u}→g{g}" for u, g in decomp['user_to_group'][:30]])
+    st.markdown("**User -> Group tuples**")
+    user_group_text = ", ".join([f"u{u}->g{g}" for u, g in decomp['user_to_group'][:30]])
     if len(decomp['user_to_group']) > 30:
         user_group_text += f" ... ({len(decomp['user_to_group'])} total)"
     st.text(user_group_text)
 
-    st.markdown("**Resource → Group tuples**")
-    res_group_text = ", ".join([f"r{r}→g{g}" for r, g in decomp['resource_to_group'][:30]])
+    st.markdown("**Resource -> Group tuples**")
+    res_group_text = ", ".join([f"r{r}->g{g}" for r, g in decomp['resource_to_group'][:30]])
     if len(decomp['resource_to_group']) > 30:
         res_group_text += f" ... ({len(decomp['resource_to_group'])} total)"
     st.text(res_group_text)
@@ -286,7 +286,7 @@ with c5:
     st.metric("False Negatives", fn)
 
 # ====== Spectra comparison ======
-st.markdown("### Spectra: s² vs eigenvalues")
+st.markdown("### Spectra: s^2 vs eigenvalues")
 s2 = align["s"] ** 2
 wU = align["eig_user_vals"]
 wR = align["eig_res_vals"]
@@ -296,19 +296,19 @@ x = np.arange(1, kshow + 1)
 fig_spectra = make_subplots(
     rows=1,
     cols=2,
-    subplot_titles=("s² vs eig(K_u)", "s² vs eig(K_r)"),
+    subplot_titles=("s^2 vs eig(K_u)", "s^2 vs eig(K_r)"),
     horizontal_spacing=0.12,
 )
 
 fig_spectra.add_trace(
-    go.Scatter(x=x, y=s2[:kshow], mode="lines+markers", name="s²"), row=1, col=1
+    go.Scatter(x=x, y=s2[:kshow], mode="lines+markers", name="s^2"), row=1, col=1
 )
 fig_spectra.add_trace(
     go.Scatter(x=x, y=wU[:kshow], mode="lines+markers", name="eig Ku"), row=1, col=1
 )
 
 fig_spectra.add_trace(
-    go.Scatter(x=x, y=s2[:kshow], mode="lines+markers", name="s²"), row=1, col=2
+    go.Scatter(x=x, y=s2[:kshow], mode="lines+markers", name="s^2"), row=1, col=2
 )
 fig_spectra.add_trace(
     go.Scatter(x=x, y=wR[:kshow], mode="lines+markers", name="eig Kr"), row=1, col=2
@@ -324,7 +324,7 @@ orphan_users = m - len(users_with_groups)
 orphan_resources = n - len(resources_with_groups)
 
 if orphan_users > 0 or orphan_resources > 0:
-    st.warning(f"⚠️ {orphan_users} users and {orphan_resources} resources have no group membership (all below threshold τ={tau:.2f})")
+    st.warning(f"Warning: {orphan_users} users and {orphan_resources} resources have no group membership (all below threshold tau={tau:.2f})")
 
 # Show comparison with FP+FN
 tp, fp, fn, prec, rec = bin_stats(P_recon)
