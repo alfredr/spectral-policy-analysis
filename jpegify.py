@@ -7,12 +7,11 @@ Core functions:
 - degree_normalize: Normalize by row/column degrees
 - top_svd: Compute top-k singular vectors
 - spherical_kmeans: Cluster in unit sphere
-- build_rectangle_cover: Build rectangle cover from clusters
-- cover_stats: Evaluate cover quality
 - cohesion: Measure cluster cohesion
+- svd_based_group_decomposition: Decompose policies using SVD
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -171,32 +170,14 @@ def top_svd(M: np.ndarray, k: int, method: str = "auto", seed: Optional[int] = N
     Args:
         M: Input matrix
         k: Number of components
-        method: "auto" (chooses based on size), "exact" (np.linalg.svd), "randomized" (sklearn)
-        seed: Random seed for randomized SVD
+        method: Unused, kept for API compatibility
+        seed: Unused, kept for API compatibility
 
     Returns:
         U, s, Vt: Top-k SVD factors
     """
     k = min(k, min(M.shape) - 1)
 
-    # Auto-select method based on matrix size and k
-    if method == "auto":
-        # Use randomized for large matrices when k << min(m,n)
-        if min(M.shape) > 200 and k < min(M.shape) // 3:
-            method = "randomized"
-        else:
-            method = "exact"
-
-    if method == "randomized":
-        try:
-            from sklearn.utils.extmath import randomized_svd
-            U, s, Vt = randomized_svd(M, n_components=k, random_state=seed if seed is not None else 0)
-            return U, s, Vt
-        except ImportError:
-            # Fallback to exact if sklearn not available
-            pass
-
-    # Exact SVD (default)
     U, s, Vt = np.linalg.svd(M, full_matrices=False)
     return U[:, :k], s[:k], Vt[:k, :]
 
@@ -252,6 +233,7 @@ def spherical_kmeans(
     # init: random rows
     idx = rng.choice(Xn.shape[0], size=k, replace=False)
     C = Xn[idx].copy()
+    labels = np.zeros(Xn.shape[0], dtype=int)
     for _ in range(iters):
         sims = Xn @ C.T
         labels = np.argmax(sims, axis=1)
@@ -267,80 +249,6 @@ def spherical_kmeans(
                 n = np.linalg.norm(v) + 1e-12
                 C[j] = v / n
     return labels
-
-
-def build_rectangle_cover(  # noqa: C901
-    P: np.ndarray,
-    user_labels: np.ndarray,
-    resource_labels: Optional[np.ndarray],
-    tau: float = 0.6,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Given user and (optionally) resource cluster labels, construct a Boolean rectangle cover:
-      - If resource_labels is provided: rectangles are (U_c, R_d) for dense blocks (density >= tau).
-      - Else: for each user cluster, take majority resource set S_c (>= tau within cluster).
-    Returns list of (user_indicator, resource_indicator).
-    """
-    m, n = P.shape
-    cover = []
-    if resource_labels is None:
-        # Majority resources per user cluster
-        for c in np.unique(user_labels):
-            Uc = user_labels == c
-            if Uc.sum() == 0:
-                continue
-            col_frac = P[Uc].mean(
-                axis=0
-            )  # fraction of users in cluster with the resource
-            Rc = col_frac >= tau
-            if Rc.sum() == 0:
-                continue
-            cover.append((Uc.astype(np.uint8), Rc.astype(np.uint8)))
-    else:
-        for c in np.unique(user_labels):
-            Uc = user_labels == c
-            if Uc.sum() == 0:
-                continue
-            for d in np.unique(resource_labels):
-                Rd = resource_labels == d
-                if Rd.sum() == 0:
-                    continue
-                density = P[Uc][:, Rd].mean()
-                if density >= tau:
-                    cover.append((Uc.astype(np.uint8), Rd.astype(np.uint8)))
-    return cover
-
-
-def cover_stats(
-    P: np.ndarray, cover: List[Tuple[np.ndarray, np.ndarray]]
-) -> Dict[str, Any]:
-    """
-    Evaluate a rectangle cover: how many ones covered, rectangles used, precision/recall on ones.
-    """
-    if not cover:
-        return {
-            "rectangles": 0,
-            "ones": int(P.sum()),
-            "covered_ones": 0,
-            "precision": 0.0,
-            "recall": 0.0,
-        }
-    m, n = P.shape
-    C = np.zeros_like(P, dtype=np.uint8)
-    for Uc, Rc in cover:
-        C |= (Uc[:, None] & Rc[None, :]).astype(np.uint8)
-    tp = int((C & P).sum())
-    fp = int((C & (1 - P)).sum())
-    fn = int(((1 - C) & P).sum())
-    prec = tp / (tp + fp) if (tp + fp) else 0.0
-    rec = tp / (tp + fn) if (tp + fn) else 0.0
-    return {
-        "rectangles": len(cover),
-        "ones": int(P.sum()),
-        "covered_ones": tp,
-        "precision": prec,
-        "recall": rec,
-    }
 
 
 # ---------- NEW: kernel & spectral helpers ----------
@@ -362,7 +270,7 @@ def build_user_kernel(P: np.ndarray, measure: str = "degree") -> np.ndarray:
         Q = P / du[:, None]
         return Q @ Q.T
     else:  # degree
-        M, Du_is, Dr_is = degree_normalize(P)
+        M, _, _ = degree_normalize(P)
         # K_u = M M^T
         return M @ M.T
 
@@ -380,7 +288,7 @@ def build_resource_kernel(P: np.ndarray, measure: str = "degree") -> np.ndarray:
         Q = P / dr[None, :]
         return Q.T @ Q
     else:  # degree
-        M, Du_is, Dr_is = degree_normalize(P)
+        M, _, _ = degree_normalize(P)
         return M.T @ M
 
 
@@ -481,10 +389,9 @@ def pr_curve_from_scores(
     Compute precision-recall curve over thresholds.
     Returns dict with taus, precision, recall, f1, best_tau, best_f1, auprc.
     """
-    if taus is None:
-        taus = np.linspace(P_scores.min(), P_scores.max(), 101)
+    tau_values = taus if taus is not None else np.linspace(P_scores.min(), P_scores.max(), 101)
     precisions, recalls, f1s = [], [], []
-    for t in taus:
+    for t in tau_values:
         P_bin = (P_scores >= t).astype(np.uint8)
         tp = int(((P_bin == 1) & (P_true == 1)).sum())
         fp = int(((P_bin == 1) & (P_true == 0)).sum())
@@ -499,41 +406,22 @@ def pr_curve_from_scores(
     order = np.argsort(recalls)
     R = np.array(recalls)[order]
     Pp = np.array(precisions)[order]
-    auprc = np.trapz(Pp, R)
+    auprc = np.trapezoid(Pp, R)
     best_idx = int(np.argmax(f1s))
     return {
-        "taus": np.array(taus),
+        "taus": np.array(tau_values),
         "precision": np.array(precisions),
         "recall": np.array(recalls),
         "f1": np.array(f1s),
-        "best_tau": float(taus[best_idx]),
+        "best_tau": float(tau_values[best_idx]),
         "best_f1": float(f1s[best_idx]),
         "auprc": float(auprc),
     }
 
 
-def scree_elbow(svals_sq: np.ndarray) -> int:
-    """
-    Simple elbow detector: first index with drop > median drop.
-    """
-    drops = svals_sq[:-1] - svals_sq[1:]
-    if len(drops) == 0:
-        return 1
-    thr = np.median(drops)
-    idx = np.argmax(drops > thr)
-    return int(idx + 1) if drops[idx] > thr else 1
-
-
-def median_principal_angle_degrees(angles_rad: np.ndarray) -> float:
-    """
-    Convert principal angles from radians to degrees and return median.
-    """
-    return float(np.median(angles_rad) * 180 / np.pi)
-
-
 def permute_matrix(
     P: np.ndarray,
-    planted: List[Dict[str, Any]],
+    _planted: List[Dict[str, Any]],
     seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], np.ndarray, np.ndarray]:
     """
@@ -541,7 +429,7 @@ def permute_matrix(
 
     Args:
         P: Binary matrix (m x n)
-        planted: List of planted block dicts with 'r0', 'c0', 'h', 'w'
+        _planted: Unused, kept for API compatibility
         seed: Random seed for reproducible permutation
 
     Returns:
@@ -568,6 +456,54 @@ def permute_matrix(
     return P_perm, planted_perm, row_perm, col_perm
 
 
+def _optimize_tau_fixed_j(
+    P: np.ndarray,
+    U: np.ndarray,
+    s: np.ndarray,
+    Vt: np.ndarray,
+    current_j: int,
+    tau_range: Tuple[float, float],
+    best_complexity: float,
+) -> Tuple[float, float, bool]:
+    """Optimize tau with fixed j using grid search."""
+    best_tau = (tau_range[0] + tau_range[1]) / 2
+    improved = False
+
+    tau_values = np.linspace(tau_range[0], tau_range[1], 25)
+    for tau in tau_values:
+        decomp = svd_based_group_decomposition(P, U, s, Vt, current_j, threshold=float(tau))
+        if decomp['complexity'] < best_complexity:
+            best_complexity = decomp['complexity']
+            best_tau = float(tau)
+            improved = True
+
+    return best_tau, best_complexity, improved
+
+
+def _optimize_j_fixed_tau(
+    P: np.ndarray,
+    U: np.ndarray,
+    s: np.ndarray,
+    Vt: np.ndarray,
+    current_tau: float,
+    j_range: Tuple[int, int],
+    max_j: int,
+    best_j: int,
+    best_complexity: float,
+) -> Tuple[int, float, bool]:
+    """Optimize j with fixed tau, preferring smaller ranks."""
+    improved = False
+
+    for j in range(j_range[0], max_j + 1):
+        decomp = svd_based_group_decomposition(P, U, s, Vt, j, threshold=current_tau)
+        if decomp['complexity'] < best_complexity or (decomp['complexity'] == best_complexity and j < best_j):
+            best_complexity = decomp['complexity']
+            best_j = j
+            improved = True
+
+    return best_j, best_complexity, improved
+
+
 def optimize_svd_params(
     P: np.ndarray,
     U: np.ndarray,
@@ -590,7 +526,6 @@ def optimize_svd_params(
     """
     max_j = min(j_range[1], min(U.shape[1], s.shape[0]) - 1)
 
-    # Start with middle values
     current_j = (j_range[0] + max_j) // 2
     current_tau = (tau_range[0] + tau_range[1]) / 2
 
@@ -598,32 +533,18 @@ def optimize_svd_params(
     best_j = current_j
     best_tau = current_tau
 
-    # Coordinate descent: alternate optimizing j and tau
-    for iteration in range(10):  # Max 10 iterations
-        improved = False
+    for _ in range(10):
+        current_tau, best_complexity, tau_improved = _optimize_tau_fixed_j(
+            P, U, s, Vt, current_j, tau_range, best_complexity
+        )
+        best_tau = current_tau
 
-        # Optimize tau with fixed j (grid search over tau values)
-        tau_values = np.linspace(tau_range[0], tau_range[1], 25)
-        for tau in tau_values:
-            decomp = svd_based_group_decomposition(P, U, s, Vt, current_j, threshold=float(tau))
-            if decomp['complexity'] < best_complexity:
-                best_complexity = decomp['complexity']
-                current_tau = float(tau)
-                best_tau = current_tau
-                improved = True
+        best_j, best_complexity, j_improved = _optimize_j_fixed_tau(
+            P, U, s, Vt, current_tau, j_range, max_j, best_j, best_complexity
+        )
+        current_j = best_j
 
-        # Optimize j with fixed tau (discrete search, prefer smaller ranks)
-        for j in range(j_range[0], max_j + 1):
-            decomp = svd_based_group_decomposition(P, U, s, Vt, j, threshold=current_tau)
-            # Prefer smaller j if complexity is equal or better
-            if decomp['complexity'] < best_complexity or (decomp['complexity'] == best_complexity and j < best_j):
-                best_complexity = decomp['complexity']
-                current_j = j
-                best_j = j
-                improved = True
-
-        # Stop if no improvement
-        if not improved:
+        if not (tau_improved or j_improved):
             break
 
     return {
@@ -633,62 +554,81 @@ def optimize_svd_params(
     }
 
 
-def optimize_group_params(
+def _build_svd_group_membership(
+    U_norm: np.ndarray,
+    Vt_norm: np.ndarray,
+    j: int,
+    threshold: float,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], Set[int]]:
+    """Build initial group membership from thresholded SVD components."""
+    user_to_group = []
+    resource_to_group = []
+    active_groups = set()
+
+    for k in range(j):
+        users_k = np.where(U_norm[:, k] > threshold)[0]
+        resources_k = np.where(Vt_norm[k, :] > threshold)[0]
+
+        if len(users_k) == 0 or len(resources_k) == 0:
+            continue
+
+        active_groups.add(k)
+        user_to_group.extend((int(u), k) for u in users_k)
+        resource_to_group.extend((int(r), k) for r in resources_k)
+
+    return user_to_group, resource_to_group, active_groups
+
+
+def _ensure_all_entities_assigned(
+    user_to_group: List[Tuple[int, int]],
+    resource_to_group: List[Tuple[int, int]],
+    active_groups: Set[int],
+    U_norm: np.ndarray,
+    Vt_norm: np.ndarray,
+    m: int,
+    n: int,
+) -> None:
+    """Ensure every user/resource is assigned to at least one group."""
+    assigned_users = set(u for u, _ in user_to_group)
+    assigned_resources = set(r for r, _ in resource_to_group)
+
+    for u in range(m):
+        if u in assigned_users:
+            continue
+        best_k = int(np.argmax(np.abs(U_norm[u, :])))
+        user_to_group.append((u, best_k))
+        active_groups.add(best_k)
+
+    for r in range(n):
+        if r in assigned_resources:
+            continue
+        best_k = int(np.argmax(np.abs(Vt_norm[:, r])))
+        resource_to_group.append((r, best_k))
+        active_groups.add(best_k)
+
+
+def _compute_svd_exceptions(
     P: np.ndarray,
     U: np.ndarray,
-    j_range: Tuple[int, int] = (2, 20),
-    density_thresholds: Optional[np.ndarray] = None,
-    seed: int = 0,
-) -> Dict[str, Any]:
-    """
-    Grid search to find optimal (j, density_threshold) that minimizes exception count.
+    s: np.ndarray,
+    Vt: np.ndarray,
+    j: int,
+    threshold: float,
+) -> List[Tuple[str, int, int]]:
+    """Compute exceptions between original and SVD reconstruction."""
+    P_svd_recon = svd_reconstruct(P, U, s, Vt, j, measure='degree')
+    P_svd_thresh = (P_svd_recon >= threshold).astype(np.uint8)
 
-    Args:
-        P: Binary access matrix
-        U: Left singular vectors from SVD
-        j_range: (min_j, max_j) range to search
-        density_thresholds: Array of density thresholds to try (default: [0.3, 0.4, ..., 0.9])
-        seed: Random seed for clustering
+    exceptions = []
+    m, n = P.shape
+    for u in range(m):
+        for r in range(n):
+            if P[u, r] == 1 and P_svd_thresh[u, r] == 0:
+                exceptions.append(('Permit', u, r))
+            elif P[u, r] == 0 and P_svd_thresh[u, r] == 1:
+                exceptions.append(('Deny', u, r))
 
-    Returns:
-        Dict with best_j, best_density, min_exceptions, and search results
-    """
-    if density_thresholds is None:
-        density_thresholds = np.arange(0.3, 1.0, 0.1)
-
-    best_j = j_range[0]
-    best_density = density_thresholds[0]
-    min_exceptions = float('inf')
-    results = []
-
-    num_blocks = min(j_range[1], 10)  # estimate cluster count
-
-    for j in range(j_range[0], min(j_range[1] + 1, U.shape[1])):
-        num_clusters = min(num_blocks, j)
-        user_labels = spherical_kmeans(U[:, :j], k=num_clusters, seed=seed)
-
-        for density in density_thresholds:
-            decomp = group_decomposition(P, user_labels, density_threshold=density)
-            num_exc = decomp['num_exceptions']
-
-            results.append({
-                'j': j,
-                'density': float(density),
-                'exceptions': num_exc,
-                'complexity': decomp['complexity'],
-            })
-
-            if num_exc < min_exceptions:
-                min_exceptions = num_exc
-                best_j = j
-                best_density = float(density)
-
-    return {
-        'best_j': best_j,
-        'best_density': best_density,
-        'min_exceptions': int(min_exceptions),
-        'results': results,
-    }
+    return exceptions
 
 
 def svd_based_group_decomposition(
@@ -721,90 +661,31 @@ def svd_based_group_decomposition(
     sj = s[:j]
     Vtj = Vt[:j, :]
 
-    # Weight by singular values for each component
-    U_weighted = Uj * sj[None, :]  # (m, j)
-    Vt_weighted = Vtj * sj[:, None]  # (j, n)
-
-    # Normalize to [0, 1] for thresholding
+    # Weight by singular values and normalize for thresholding
+    U_weighted = Uj * sj[None, :]
+    Vt_weighted = Vtj * sj[:, None]
     U_norm = U_weighted / (np.abs(U_weighted).max(axis=0, keepdims=True) + 1e-12)
     Vt_norm = Vt_weighted / (np.abs(Vt_weighted).max(axis=1, keepdims=True) + 1e-12)
 
-    # Build tuples: user->group and resource->group
-    user_to_group = []  # List of (user, group) tuples
-    resource_to_group = []  # List of (resource, group) tuples
-    active_groups = set()
+    # Build group membership
+    user_to_group, resource_to_group, active_groups = _build_svd_group_membership(
+        U_norm, Vt_norm, j, threshold
+    )
 
-    for k in range(j):
-        users_k = np.where(U_norm[:, k] > threshold)[0]
-        resources_k = np.where(Vt_norm[k, :] > threshold)[0]
+    # Ensure all entities are assigned
+    _ensure_all_entities_assigned(
+        user_to_group, resource_to_group, active_groups, U_norm, Vt_norm, m, n
+    )
 
-        if len(users_k) > 0 and len(resources_k) > 0:
-            active_groups.add(k)
-            for u in users_k:
-                user_to_group.append((int(u), k))
-            for r in resources_k:
-                resource_to_group.append((int(r), k))
-
-    # Ensure every user/resource is assigned to at least one group (their top component)
-    assigned_users = set(u for u, g in user_to_group)
-    assigned_resources = set(r for r, g in resource_to_group)
-
-    for u in range(m):
-        if u not in assigned_users:
-            # Assign to component with highest absolute loading
-            best_k = int(np.argmax(np.abs(U_norm[u, :])))
-            user_to_group.append((u, best_k))
-            active_groups.add(best_k)
-
-    for r in range(n):
-        if r not in assigned_resources:
-            # Assign to component with highest absolute loading
-            best_k = int(np.argmax(np.abs(Vt_norm[:, r])))
-            resource_to_group.append((r, best_k))
-            active_groups.add(best_k)
-
-    # Build predicted access from group membership
-    P_predicted = np.zeros_like(P, dtype=np.uint8)
-
-    # Group users and resources by their groups
-    user_groups = {}
-    for u, g in user_to_group:
-        if u not in user_groups:
-            user_groups[u] = set()
-        user_groups[u].add(g)
-
-    resource_groups = {}
-    for r, g in resource_to_group:
-        if r not in resource_groups:
-            resource_groups[r] = set()
-        resource_groups[r].add(g)
-
-    # User u can access resource r if they share at least one group
-    for u in range(m):
-        for r in range(n):
-            if u in user_groups and r in resource_groups:
-                if user_groups[u] & resource_groups[r]:  # Intersection
-                    P_predicted[u, r] = 1
-
-    # Exceptions = symmetric difference between SVD reconstruction and original
-    # Groups represent the SVD reconstruction; exceptions patch to match original
-    P_svd_recon = svd_reconstruct(P, U, s, Vt, j, measure='degree')
-    P_svd_thresh = (P_svd_recon >= threshold).astype(np.uint8)
-
-    exceptions = []
-    for u in range(m):
-        for r in range(n):
-            if P[u, r] == 1 and P_svd_thresh[u, r] == 0:
-                exceptions.append(('Permit', u, r))
-            elif P[u, r] == 0 and P_svd_thresh[u, r] == 1:
-                exceptions.append(('Deny', u, r))
+    # Compute exceptions
+    exceptions = _compute_svd_exceptions(P, U, s, Vt, j, threshold)
 
     # Complexity = total number of tuples
     complexity = len(user_to_group) + len(resource_to_group) + len(exceptions)
 
     return {
-        'user_to_group': user_to_group,  # List of (user, group) tuples
-        'resource_to_group': resource_to_group,  # List of (resource, group) tuples
+        'user_to_group': user_to_group,
+        'resource_to_group': resource_to_group,
         'exceptions': exceptions,
         'complexity': complexity,
         'num_groups': len(active_groups),
@@ -815,73 +696,3 @@ def svd_based_group_decomposition(
     }
 
 
-def group_decomposition(
-    P: np.ndarray,
-    user_labels: np.ndarray,
-    density_threshold: float = 0.6,
-) -> Dict[str, Any]:
-    """
-    Decompose access matrix into group-based rules plus exceptions.
-
-    Args:
-        P: Binary access matrix (m users x n resources)
-        user_labels: Cluster labels for users (length m)
-        density_threshold: Minimum density to create a group->resource rule
-
-    Returns:
-        Dict with:
-            - user_to_group: List of (user_idx, group_id) tuples
-            - group_to_resources: List of (group_id, resource_idxs) tuples
-            - exceptions: List of ('Permit', user, resource) or ('Deny', user, resource)
-            - complexity: Total number of items across all lists
-    """
-    m, n = P.shape
-    num_groups = len(np.unique(user_labels))
-
-    # 1. User-to-group mappings
-    user_to_group = [(u, int(user_labels[u])) for u in range(m)]
-
-    # 2. Group-to-resource mappings
-    group_to_resources = []
-    for g in range(num_groups):
-        users_in_g = np.where(user_labels == g)[0]
-        if len(users_in_g) == 0:
-            continue
-
-        # Find resources accessed by >= density_threshold of users in this group
-        resource_coverage = P[users_in_g].mean(axis=0)  # fraction of group accessing each resource
-        resources_for_g = np.where(resource_coverage >= density_threshold)[0]
-
-        if len(resources_for_g) > 0:
-            group_to_resources.append((g, resources_for_g.tolist()))
-
-    # 3. Build predicted access matrix from group rules
-    P_predicted = np.zeros_like(P, dtype=np.uint8)
-    for g, resources in group_to_resources:
-        users_in_g = np.where(user_labels == g)[0]
-        for u in users_in_g:
-            for r in resources:
-                P_predicted[u, r] = 1
-
-    # 4. Find exceptions (only count differences, the symmetric difference)
-    exceptions = []
-    for u in range(m):
-        for r in range(n):
-            if P[u, r] == 1 and P_predicted[u, r] == 0:
-                exceptions.append(('Permit', u, r))
-            elif P[u, r] == 0 and P_predicted[u, r] == 1:
-                exceptions.append(('Deny', u, r))
-
-    # Complexity: user assignments + group-resource rules + exceptions
-    # Note: user_to_group always has m entries, so we count groups + group rules + exceptions
-    num_group_rules = sum(len(resources) for _, resources in group_to_resources)
-    complexity = num_groups + num_group_rules + len(exceptions)
-
-    return {
-        'user_to_group': user_to_group,
-        'group_to_resources': group_to_resources,
-        'exceptions': exceptions,
-        'complexity': complexity,
-        'num_groups': num_groups,
-        'num_exceptions': len(exceptions),
-    }
